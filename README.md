@@ -1,6 +1,6 @@
-# Florence-2 Federated Learning for Chest X-Ray Captioning
+# Florence-2 Federated Learning for Captioning
 
-Fine-tunes [Microsoft Florence-2](https://huggingface.co/microsoft/Florence-2-base) for detailed image captioning using Federated Learning (FedProx + FedAvg) with LoRA adapters in fp16. No quantization, no bitsandbytes — runs comfortably on a single Tesla V100 16 GB.
+Fine-tunes [Microsoft Florence-2](https://huggingface.co/microsoft/Florence-2-base) for detailed image captioning using Federated Learning (FedProx + FedAvg) with LoRA adapters in fp16.
 
 ---
 
@@ -20,7 +20,6 @@ Florence/
 
 ---
 
-## Step 1 — Prepare Your Data
 
 Place your images in `data/images/` and create `data/annotations/annotations.jsonl`. Each line is one JSON object:
 
@@ -35,7 +34,7 @@ Place your images in `data/images/` and create `data/annotations/annotations.jso
 
 ---
 
-## Step 2 — Set Up the Environment
+
 
 **Create and activate a conda environment:**
 
@@ -58,7 +57,7 @@ pip install -r requirements.txt
 
 ---
 
-## Step 3 — Split Data into Federated Clients
+### Split Data into Federated Clients
 
 `federated_split.py` takes your `data/` folder and splits it into 3 client folders + a held-out test set using a Dirichlet distribution.
 
@@ -111,7 +110,7 @@ data/
 
 ---
 
-## Step 4 — Run Federated Training
+##  Run Federated Training
 
 `florence_fed_captioning.py` loads the split data, fine-tunes Florence-2 with LoRA across 3 clients for 20 rounds using FedProx + FedAvg aggregation.
 
