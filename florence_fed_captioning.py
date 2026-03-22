@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Florence-2 Federated Learning for Detailed Captioning
-Model : microsoft/Florence-2-large-ft (LoRA + fp16, NO quantization)
+Model : microsoft/Florence-2-base (LoRA + fp16, NO quantization)
 GPU   : Tesla V100 16 GB  — fp16 + LoRA fits comfortably without bitsandbytes
 Task  : <DETAILED_CAPTION>
-FL    : 3 clients, 20 rounds, FedProx, FedAvg aggregation
+FL    : 3 clients, 30 rounds, FedProx + Adaptive MU, FedAvg aggregation
 Eval  : BLEU / METEOR / ROUGE-L / CIDEr
 Output: <output_dir>/run_YYYY-MM-DD_HH-MM-SS/
           ├── run_config.json
+          ├── training.log
           ├── model_checkpoints/best/
           └── scores/
                ├── round_metrics.csv   (live update every round)
@@ -17,6 +18,8 @@ Output: <output_dir>/run_YYYY-MM-DD_HH-MM-SS/
 import os
 import json
 import gc
+import logging
+import sys
 import argparse
 import numpy as np
 import pandas as pd
@@ -40,6 +43,8 @@ from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
 from pycocoevalcap.cider.cider import Cider
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # ========================= NLTK DOWNLOADS =========================
 nltk.download("punkt",     quiet=True)
 nltk.download("punkt_tab", quiet=True)
@@ -47,25 +52,42 @@ nltk.download("wordnet",   quiet=True)
 nltk.download("omw-1.4",   quiet=True)
 
 # ========================= ARGUMENTS =========================
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/fed_input_data")
-OUTPUT_DIR=os.path.join(os.path.dirname(os.path.abspath(__file__)), "Output")
+DATA_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/fed_input_data")
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Output")
+MU= 1.55
 parser = argparse.ArgumentParser()
-parser.add_argument("--data_dir",   type=str, default=DATA_DIR,
+parser.add_argument("--data_dir",   type=str,   default=DATA_DIR,
                     help="Path to fed_input_data/")
-parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR,
+parser.add_argument("--output_dir", type=str,   default=OUTPUT_DIR,
                     help="Base path — each run creates output_dir/run_YYYY-MM-DD_HH-MM-SS/")
+parser.add_argument("--mu_fedprox", type=float, default=MU,
+                    help="FedProx proximal term coefficient (default: 1.5507)")
 args = parser.parse_args()
 
 DATA_DIR = args.data_dir
+MU       = args.mu_fedprox
 
 # ── Timestamped run directory ─────────────────────────────────────────────────
 RUN_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 OUTPUT_DIR    = os.path.join(args.output_dir, f"run_{RUN_TIMESTAMP}")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-print(f"\n{'='*70}")
-print(f"Run directory : {OUTPUT_DIR}")
-print(f"{'='*70}\n")
+
+# ── Logger setup ──────────────────────────────────────────────────────────────
+LOG_FILE = os.path.join(OUTPUT_DIR, "training.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+log = logging.getLogger()
+
+log.info("=" * 70)
+log.info(f"Run directory : {OUTPUT_DIR}")
+log.info("=" * 70)
 
 # ========================= CONFIGURATION =========================
 MODEL_NAME   = "microsoft/Florence-2-base"
@@ -75,35 +97,38 @@ RESIZE_IMAGES       = False
 RESIZE_SCALE_FACTOR = 0.5
 
 # LoRA
-LORA_R       = 8     # down from 16
-LORA_ALPHA   = 16    # keep 2x of r — standard practice
-LORA_DROPOUT = 0.05  # slightly lower dropout for smaller r
+LORA_R       = 16
+LORA_ALPHA   = 32    # 2x of r — standard practice
+LORA_DROPOUT = 0.05
 
 # FL
 NUM_CLIENTS   = 3
-ROUNDS        = 20
-LOCAL_EPOCHS  = 2
-LEARNING_RATE = 1e-4
-BATCH_SIZE    = 2        # fp16 on V100 16 GB — safe at 2
-PATIENCE      = 6
-MU            = 0.01     # FedProx
+ROUNDS        = 30
+LOCAL_EPOCHS  = 1
+LEARNING_RATE = 5e-5
+BATCH_SIZE    = 6
+PATIENCE      = 30
 
-# --- Memory Optimization ---
-GRADIENT_CHECKPOINTING    = True  # saves VRAM by recomputing activations
-GRADIENT_ACCUMULATION     = 4     # accumulate gradients over N steps
-                                  # effective batch size = BATCH_SIZE * GRADIENT_ACCUMULATION
+# Adaptive MU bounds
 
-# Device  (NO quantization — fp16 only, no bitsandbytes needed)
+
+# Memory Optimization
+GRADIENT_CHECKPOINTING = True
+GRADIENT_ACCUMULATION  = 4    # effective batch = BATCH_SIZE * GRADIENT_ACCUMULATION = 24
+
+# Device (NO quantization — fp16 only, no bitsandbytes needed)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 DEVICE      = torch.device("cuda:0")
 torch_dtype = torch.float16
 torch.cuda.set_device(0)
 
-print(f"Device      : {DEVICE}  ({torch.cuda.get_device_name(0)})")
-print(f"Model       : {MODEL_NAME}")
-print(f"Task        : {CAPTION_TASK}")
-print(f"Precision   : fp16  (no quantization — no bitsandbytes)")
-print(f"Batch size  : {BATCH_SIZE}")
+log.info(f"Device      : {DEVICE}  ({torch.cuda.get_device_name(0)})")
+log.info(f"Model       : {MODEL_NAME}")
+log.info(f"Task        : {CAPTION_TASK}")
+log.info(f"Precision   : fp16  (no quantization)")
+log.info(f"Batch size  : {BATCH_SIZE}  (effective: {BATCH_SIZE * GRADIENT_ACCUMULATION})")
+log.info(f"LoRA r/alpha: {LORA_R}/{LORA_ALPHA}")
+log.info(f"LR          : {LEARNING_RATE}  |  MU (initial): {MU}  |  Rounds: {ROUNDS}  |  Patience: {PATIENCE}")
 
 # ========================= OUTPUT DIRS =========================
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "model_checkpoints")
@@ -113,26 +138,31 @@ os.makedirs(SCORES_DIR,     exist_ok=True)
 
 # ── Persist run config ────────────────────────────────────────────────────────
 run_config = {
-    "run_timestamp" : RUN_TIMESTAMP,
-    "model"         : MODEL_NAME,
-    "task"          : CAPTION_TASK,
-    "precision"     : "fp16_no_quantization",
-    "lora_r"        : LORA_R,
-    "lora_alpha"    : LORA_ALPHA,
-    "lora_dropout"  : LORA_DROPOUT,
-    "num_clients"   : NUM_CLIENTS,
-    "rounds"        : ROUNDS,
-    "local_epochs"  : LOCAL_EPOCHS,
-    "learning_rate" : LEARNING_RATE,
-    "batch_size"    : BATCH_SIZE,
-    "patience"      : PATIENCE,
-    "mu_fedprox"    : MU,
-    "data_dir"      : DATA_DIR,
-    "output_dir"    : OUTPUT_DIR,
+    "run_timestamp"    : RUN_TIMESTAMP,
+    "model"            : MODEL_NAME,
+    "task"             : CAPTION_TASK,
+    "precision"        : "fp16_no_quantization",
+    "lora_r"           : LORA_R,
+    "lora_alpha"       : LORA_ALPHA,
+    "lora_dropout"     : LORA_DROPOUT,
+    "num_clients"      : NUM_CLIENTS,
+    "rounds"           : ROUNDS,
+    "local_epochs"     : LOCAL_EPOCHS,
+    "learning_rate"    : LEARNING_RATE,
+    "batch_size"       : BATCH_SIZE,
+    "effective_batch"  : BATCH_SIZE * GRADIENT_ACCUMULATION,
+    "patience"         : PATIENCE,
+    "mu_fedprox_init"  : MU,
+    "mu_min"           : MU_MIN,
+    "mu_max"           : MU_MAX,
+    "adaptive_mu"      : True,
+    "data_dir"         : DATA_DIR,
+    "output_dir"       : OUTPUT_DIR,
+    "log_file"         : LOG_FILE,
 }
 with open(os.path.join(OUTPUT_DIR, "run_config.json"), "w") as f:
     json.dump(run_config, f, indent=2)
-print(f"Config saved → {os.path.join(OUTPUT_DIR, 'run_config.json')}\n")
+log.info(f"Config saved → {os.path.join(OUTPUT_DIR, 'run_config.json')}\n")
 
 # ========================= HELPERS =========================
 def gpu_mem_str():
@@ -142,10 +172,42 @@ def gpu_mem_str():
         return f"{alloc:.1f}/{reserved:.1f}GB"
     return "N/A"
 
+def estimate_mu(ce_loss, prox_term, target_ratio=0.1):
+    """
+    Suggests MU such that proximal term = target_ratio * CE loss.
+    target_ratio=0.1 means prox term is 10% of CE loss.
+    Used for first-round diagnostic only.
+    """
+    if prox_term < 1e-8:
+        return 0.01
+    return (target_ratio * ce_loss) / prox_term
+
+#def compute_adaptive_mu(client_updates, global_params, ce_loss, target_ratio=0.1):
+    """
+    Computes MU dynamically based on actual drift observed this round.
+    Sets MU such that (MU/2) * avg_drift = target_ratio * ce_loss.
+    This makes MU self-tuning regardless of dataset size or alpha.
+    """
+    """total_drift = 0.0
+    count       = 0
+    for weights, _ in client_updates:
+        for name, w_client in weights.items():
+            if name in global_params:
+                diff = w_client.float() - global_params[name].cpu().float()
+                total_drift += (diff ** 2).sum().item()
+                count += 1
+
+    if total_drift < 1e-8 or count == 0:
+        return MU_MIN
+
+    avg_drift  = total_drift / len(client_updates)
+    suggested  = (2 * target_ratio * ce_loss) / avg_drift
+    return float(np.clip(suggested, MU_MIN, MU_MAX))"""
+
 # ========================= DATA =========================
-print("="*70)
-print("LOADING FEDERATED DATA")
-print("="*70)
+log.info("=" * 70)
+log.info("LOADING FEDERATED DATA")
+log.info("=" * 70)
 
 CLIENT_NAMES = ["client_01_data", "client_02_data", "client_03_data"]
 TEST_NAME    = "test_data"
@@ -158,7 +220,7 @@ def resize_images(image_dir, output_dir, scale):
         img = Image.open(os.path.join(image_dir, fname)).convert("RGB")
         new_size = (int(img.width * scale), int(img.height * scale))
         img.resize(new_size, Image.LANCZOS).save(os.path.join(output_dir, fname))
-    print(f"Resized → {output_dir}")
+    log.info(f"Resized → {output_dir}")
 
 class JSONLDataset:
     def __init__(self, jsonl_path, image_dir):
@@ -174,7 +236,7 @@ class JSONLDataset:
         return len(self.entries)
 
     def __getitem__(self, idx):
-        e          = self.entries[idx]
+        e           = self.entries[idx]
         image_field = e["image"]
 
         # Primary: try the path as stored (works when absolute path is valid)
@@ -183,8 +245,8 @@ class JSONLDataset:
             return Image.open(primary_path).convert("RGB"), e
 
         # Fallback: strip to bare filename and look in self.image_dir
-        # (handles the case where dataset was moved to a different machine)
-        filename     = os.path.basename(image_field)
+        # handles the case where dataset was moved to a different machine
+        filename      = os.path.basename(image_field)
         fallback_path = os.path.join(self.image_dir, filename)
         if os.path.isfile(fallback_path):
             return Image.open(fallback_path).convert("RGB"), e
@@ -226,23 +288,22 @@ for cid, name in enumerate(CLIENT_NAMES):
     ds       = CaptionDataset(ann_path, img_dir, CAPTION_TASK)
     client_datasets.append(ds)
     client_sizes.append(len(ds))
-    print(f"  Client {cid+1} ({name}): {len(ds)} samples")
+    log.info(f"  Client {cid+1} ({name}): {len(ds)} samples")
 
 # Load test dataset
 test_path    = os.path.join(DATA_DIR, TEST_NAME)
 test_img_dir = get_active_image_dir(os.path.join(test_path, "images"))
 test_ann     = os.path.join(test_path, "annotations", "annotations.jsonl")
 test_dataset = CaptionDataset(test_ann, test_img_dir, CAPTION_TASK)
-print(f"  Test set  : {len(test_dataset)} samples\n")
+log.info(f"  Test set  : {len(test_dataset)} samples\n")
 
 # ========================= MODEL + LoRA =========================
-print("="*70)
-print("LOADING FLORENCE-2 + LoRA  (fp16, no quantization)")
-print("="*70)
+log.info("=" * 70)
+log.info("LOADING FLORENCE-2 + LoRA  (fp16, no quantization)")
+log.info("=" * 70)
 
 processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
-# ── fp16 only — BitsAndBytesConfig intentionally removed ─────────────────────
 base_model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch_dtype,
@@ -267,8 +328,8 @@ global_model = get_peft_model(base_model, lora_config)
 global_model.enable_input_require_grads()
 global_model.gradient_checkpointing_enable()
 global_model.print_trainable_parameters()
-print(f"GPU after model load : {gpu_mem_str()}")
-print("LoRA applied — only adapter weights are trainable\n")
+log.info(f"GPU after model load : {gpu_mem_str()}")
+log.info("LoRA applied — only adapter weights are trainable\n")
 
 # ========================= COLLATE =========================
 def collate_fn(batch):
@@ -278,7 +339,9 @@ def collate_fn(batch):
         images=list(images),
         return_tensors="pt",
         padding=True,
-    ).to(DEVICE)
+    )
+    # NOTE: do NOT call .to(DEVICE) here — causes CUDA error in forked workers
+    # device + dtype transfer is done in the training loop
     return inputs, captions
 
 # ========================= LOCAL TRAINING =========================
@@ -286,11 +349,12 @@ def local_train(model, dataset, epochs, lr, global_ref_params,
                 round_num, client_id):
     loader = DataLoader(
         dataset, batch_size=BATCH_SIZE, shuffle=True,
-        collate_fn=collate_fn, num_workers=0,
+        collate_fn=collate_fn, num_workers=6,
+        pin_memory=True,
+        prefetch_factor=2,
     )
-    optimizer    = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
-    
-    # account for accumulation steps in total training steps
+    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
+
     # max(..., 1) guards against tiny datasets where len(loader) < GRADIENT_ACCUMULATION
     num_steps    = max(1, epochs * (len(loader) // GRADIENT_ACCUMULATION))
     lr_scheduler = get_scheduler("linear", optimizer,
@@ -298,11 +362,13 @@ def local_train(model, dataset, epochs, lr, global_ref_params,
                                  num_training_steps=num_steps)
     model.train()
     global_step = 0
-    optimizer.zero_grad()  # moved outside loop for accumulation
+    optimizer.zero_grad()
+
+    epoch_loss_out = 0.0   # expose to caller for adaptive MU
 
     for epoch in range(epochs):
-        epoch_loss  = 0.0
-        epoch_prox  = 0.0
+        epoch_loss = 0.0
+        epoch_prox = 0.0
 
         bar = tqdm(
             loader,
@@ -312,8 +378,9 @@ def local_train(model, dataset, epochs, lr, global_ref_params,
         )
 
         for step, (inputs, captions) in enumerate(bar, 1):
+            # transfer to device + fp16 in training loop (not in collate_fn)
             inputs = {
-                k: v.to(dtype=torch_dtype) if v.dtype.is_floating_point else v
+                k: v.to(device=DEVICE, dtype=torch_dtype) if v.dtype.is_floating_point else v.to(DEVICE)
                 for k, v in inputs.items()
             }
             labels = processor.tokenizer(
@@ -341,7 +408,7 @@ def local_train(model, dataset, epochs, lr, global_ref_params,
             epoch_loss += ce_loss.item()
             epoch_prox += prox_term.item()
 
-            # only update weights every GRADIENT_ACCUMULATION steps
+            # update weights every GRADIENT_ACCUMULATION steps
             if step % GRADIENT_ACCUMULATION == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -365,14 +432,29 @@ def local_train(model, dataset, epochs, lr, global_ref_params,
             lr_scheduler.step()
             optimizer.zero_grad()
 
-        print(
+        epoch_loss_out = epoch_loss / len(loader)
+        log.info(
             f"    ↳ Epoch {epoch+1} done | "
-            f"avg CE={epoch_loss/len(loader):.4f} | "
+            f"avg CE={epoch_loss_out:.4f} | "
             f"avg prox={epoch_prox/len(loader):.4f} | "
             f"GPU {gpu_mem_str()}"
         )
 
-        
+        # MU diagnostic — only on first epoch of first round, first client
+        if epoch == 0 and round_num == 1 and client_id == 1:
+            avg_ce   = epoch_loss / len(loader)
+            avg_prox = epoch_prox / len(loader)
+            if avg_prox > 1e-8:
+                suggested_mu = estimate_mu(avg_ce, avg_prox)
+                log.info(
+                    f"\n  [MU DIAGNOSTIC] current={MU:.4f} | "
+                    f"avg_ce={avg_ce:.4f} | avg_prox={avg_prox:.4f} | "
+                    f"static suggestion ≈ {suggested_mu:.4f}  "
+                    f"(adaptive MU will auto-tune each round)"
+                )
+
+    return epoch_loss_out
+
 # ========================= EVALUATION =========================
 def generate_predictions(model, dataset, processor, max_samples=200):
     model.eval()
@@ -383,8 +465,15 @@ def generate_predictions(model, dataset, processor, max_samples=200):
     with torch.no_grad():
         for i in bar:
             prefix, gt, img = dataset[i]
-            inputs    = processor(text=prefix, images=img,
-                                  return_tensors="pt").to(DEVICE)
+            inputs = processor(text=prefix, images=img,
+                               return_tensors="pt").to(DEVICE)
+
+            # cast to fp16 to match model weights
+            inputs = {
+                k: v.to(dtype=torch.float16) if v.dtype.is_floating_point else v
+                for k, v in inputs.items()
+            }
+
             generated = model.generate(
                 **inputs,
                 max_new_tokens=128,
@@ -409,8 +498,8 @@ def evaluate_captions(preds, refs):
     smooth  = SmoothingFunction().method1
     rouge   = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
     pt      = [nltk.word_tokenize(p.lower()) for p in preds]
-    rt      = [[nltk.word_tokenize(r.lower())] for r in refs]   # corpus_bleu format: list of list-of-refs
-    rt_flat = [nltk.word_tokenize(r.lower()) for r in refs]     # meteor_score format: flat token list per ref
+    rt      = [[nltk.word_tokenize(r.lower())] for r in refs]   # corpus_bleu format
+    rt_flat = [nltk.word_tokenize(r.lower()) for r in refs]     # meteor_score format
     bleu    = corpus_bleu(rt, pt, smoothing_function=smooth)
     meteor  = float(np.mean([meteor_score([rt_flat[i]], pt[i]) for i in range(len(preds))]))
     rouge_l = float(np.mean([
@@ -423,10 +512,10 @@ def evaluate_captions(preds, refs):
     return {"BLEU": bleu, "METEOR": meteor, "ROUGE-L": rouge_l, "CIDEr": float(cs)}
 
 # ========================= MAIN FL LOOP =========================
-print("\n" + "="*70)
-print("STARTING FLORENCE-2 FEDERATED TRAINING")
-print(f"Run ID : run_{RUN_TIMESTAMP}")
-print("="*70)
+log.info("\n" + "=" * 70)
+log.info("STARTING FLORENCE-2 FEDERATED TRAINING")
+log.info(f"Run ID : run_{RUN_TIMESTAMP}")
+log.info("=" * 70)
 
 BEST_CIDER       = -1.0
 BEST_ROUND       = -1
@@ -434,19 +523,23 @@ patience_counter = 0
 all_metrics      = []
 
 for round_num in range(ROUNDS):
-    progress = round_num / max(1, ROUNDS - 1)
-    round_lr = LEARNING_RATE * max(0.1, 0.5 * (1.0 + np.cos(np.pi * progress)))
+    round_lr = LEARNING_RATE   # constant LR across rounds
 
-    print(f"\n{'='*70}")
-    print(f"Round {round_num+1}/{ROUNDS}  |  LR: {round_lr:.2e}  |  "
-          f"Best CIDEr: {BEST_CIDER:.4f}  |  GPU: {gpu_mem_str()}")
-    print("="*70)
+    log.info(f"\n{'='*70}")
+    log.info(
+        f"Round {round_num+1}/{ROUNDS}  |  LR: {round_lr:.2e}  |  MU: {MU:.4f}  |  "
+        f"Best CIDEr: {BEST_CIDER:.4f}  |  GPU: {gpu_mem_str()}"
+    )
+    log.info("=" * 70)
 
-    client_updates = []
+    client_updates    = []
+    round_ce_losses   = []
 
     for cid, client_ds in enumerate(client_datasets):
-        print(f"\n  ── Client {cid+1}/{NUM_CLIENTS}  "
-              f"({CLIENT_NAMES[cid]}, {len(client_ds)} samples) ──")
+        log.info(
+            f"\n  ── Client {cid+1}/{NUM_CLIENTS}  "
+            f"({CLIENT_NAMES[cid]}, {len(client_ds)} samples) ──"
+        )
 
         # Snapshot global LoRA weights on CPU
         original_trainable = {
@@ -455,12 +548,13 @@ for round_num in range(ROUNDS):
             if param.requires_grad
         }
 
-        local_train(
+        avg_ce = local_train(
             global_model, client_ds, LOCAL_EPOCHS, round_lr,
             original_trainable,
             round_num=round_num + 1,
             client_id=cid + 1,
         )
+        round_ce_losses.append(avg_ce)
 
         # Collect updated weights
         new_trainable = {
@@ -477,12 +571,19 @@ for round_num in range(ROUNDS):
 
         gc.collect()
         torch.cuda.empty_cache()
-        print(f"  Client {cid+1} done | GPU after cleanup: {gpu_mem_str()}")
+        log.info(f"  Client {cid+1} done | GPU after cleanup: {gpu_mem_str()}")
 
     # ── FedAvg ───────────────────────────────────────────────────────────────
-    print("\n  ── FedAvg aggregation ──")
+    log.info("\n  ── FedAvg aggregation ──")
     total_size = sum(size for _, size in client_updates)
     first_keys = list(client_updates[0][0].keys())
+
+    # snapshot global weights for adaptive MU computation
+    global_params_snapshot = {
+        name: param.clone().cpu()
+        for name, param in global_model.named_parameters()
+        if param.requires_grad
+    }
 
     agg_bar = tqdm(first_keys, desc="  Aggregating weights",
                    dynamic_ncols=True, leave=False)
@@ -495,28 +596,33 @@ for round_num in range(ROUNDS):
                 param.data.copy_(avg_tensor.to(param.device))
                 break
         agg_bar.set_postfix(param=key[-35:])
-    print(f"  Aggregation done | GPU: {gpu_mem_str()}")
+    log.info(f"  Aggregation done | GPU: {gpu_mem_str()}")
+
+    """    # ── Adaptive MU update ───────────────────────────────────────────────────
+    avg_ce_this_round = float(np.mean(round_ce_losses)) if round_ce_losses else 3.0
+    MU = compute_adaptive_mu(client_updates, global_params_snapshot, avg_ce_this_round)
+    log.info(f"  Adaptive MU → {MU:.4f}  (avg CE this round: {avg_ce_this_round:.4f})")"""
 
     # ── Evaluation ───────────────────────────────────────────────────────────
-    print("\n  ── Evaluation on test set ──")
+    log.info("\n  ── Evaluation on test set ──")
     preds, refs = generate_predictions(
         global_model, test_dataset, processor, max_samples=200
     )
     metrics = evaluate_captions(preds, refs)
-    all_metrics.append({"round": round_num + 1, **metrics})
+    all_metrics.append({"round": round_num + 1, "mu": MU, **metrics})
 
-    # Live CSV
+    # Live CSV update
     pd.DataFrame(all_metrics).to_csv(
         os.path.join(SCORES_DIR, "round_metrics.csv"), index=False
     )
 
-    print(f"\n  ── Round {round_num+1} Results ──")
-    print(f"  BLEU    = {metrics['BLEU']:.4f}")
-    print(f"  METEOR  = {metrics['METEOR']:.4f}")
-    print(f"  ROUGE-L = {metrics['ROUGE-L']:.4f}")
-    print(f"  CIDEr   = {metrics['CIDEr']:.4f}")
+    log.info(f"\n  ── Round {round_num+1} Results ──")
+    log.info(f"  BLEU    = {metrics['BLEU']:.4f}")
+    log.info(f"  METEOR  = {metrics['METEOR']:.4f}")
+    log.info(f"  ROUGE-L = {metrics['ROUGE-L']:.4f}")
+    log.info(f"  CIDEr   = {metrics['CIDEr']:.4f}")
 
-    # ── Save best ────────────────────────────────────────────────────────────
+    # ── Save best / early stopping ────────────────────────────────────────────
     if metrics["CIDEr"] > BEST_CIDER:
         BEST_CIDER       = metrics["CIDEr"]
         BEST_ROUND       = round_num + 1
@@ -525,24 +631,26 @@ for round_num in range(ROUNDS):
         os.makedirs(best_path, exist_ok=True)
         global_model.save_pretrained(best_path)
         processor.save_pretrained(best_path)
-        print(f"\n  *** NEW BEST  CIDEr={BEST_CIDER:.4f} "
-              f"(round {BEST_ROUND}) → {best_path}")
+        log.info(
+            f"\n  *** NEW BEST  CIDEr={BEST_CIDER:.4f} "
+            f"(round {BEST_ROUND}) → {best_path}"
+        )
     else:
         patience_counter += 1
-        print(f"\n  No improvement ({patience_counter}/{PATIENCE})")
+        log.info(f"\n  No improvement ({patience_counter}/{PATIENCE})")
         if patience_counter >= PATIENCE:
-            print("  Early stopping triggered.")
+            log.info("  Early stopping triggered.")
             break
 
     gc.collect()
     torch.cuda.empty_cache()
 
 # ========================= FINAL EVALUATION =========================
-print("\n" + "="*70)
-print("FINAL EVALUATION  (full test set)")
-print("="*70)
+log.info("\n" + "=" * 70)
+log.info("FINAL EVALUATION  (full test set)")
+log.info("=" * 70)
 
-print("Loading best checkpoint...")
+log.info("Loading best checkpoint...")
 base_final  = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch_dtype,
@@ -557,10 +665,10 @@ preds, refs   = generate_predictions(
 )
 final_metrics = evaluate_captions(preds, refs)
 
-print(f"\n  BLEU    = {final_metrics['BLEU']:.4f}")
-print(f"  METEOR  = {final_metrics['METEOR']:.4f}")
-print(f"  ROUGE-L = {final_metrics['ROUGE-L']:.4f}")
-print(f"  CIDEr   = {final_metrics['CIDEr']:.4f}")
+log.info(f"\n  BLEU    = {final_metrics['BLEU']:.4f}")
+log.info(f"  METEOR  = {final_metrics['METEOR']:.4f}")
+log.info(f"  ROUGE-L = {final_metrics['ROUGE-L']:.4f}")
+log.info(f"  CIDEr   = {final_metrics['CIDEr']:.4f}")
 
 # ── Save results ──────────────────────────────────────────────────────────────
 results = {
@@ -576,21 +684,23 @@ results = {
 with open(os.path.join(SCORES_DIR, "final_results.json"), "w") as f:
     json.dump(results, f, indent=2)
 
-print(f"\n{'='*70}")
-print("TRAINING COMPLETE!")
-print(f"Run ID          : run_{RUN_TIMESTAMP}")
-print(f"Run directory   : {OUTPUT_DIR}")
-print(f"Best checkpoint : {os.path.join(CHECKPOINT_DIR, 'best')}")
-print(f"Scores          : {SCORES_DIR}")
-print(f"  • round_metrics.csv")
-print(f"  • final_results.json")
-print(f"  • run_config.json")
-print(f"Best CIDEr      : {BEST_CIDER:.4f}  (round {BEST_ROUND})")
-print("="*70)
+log.info(f"\n{'='*70}")
+log.info("TRAINING COMPLETE!")
+log.info(f"Run ID          : run_{RUN_TIMESTAMP}")
+log.info(f"Run directory   : {OUTPUT_DIR}")
+log.info(f"Log file        : {LOG_FILE}")
+log.info(f"Best checkpoint : {os.path.join(CHECKPOINT_DIR, 'best')}")
+log.info(f"Scores          : {SCORES_DIR}")
+log.info(f"  * round_metrics.csv  (includes MU column per round)")
+log.info(f"  * final_results.json")
+log.info(f"  * run_config.json")
+log.info(f"Best CIDEr      : {BEST_CIDER:.4f}  (round {BEST_ROUND})")
+log.info("=" * 70)
 
 
 """
 python florence_fed_captioning.py \
   --data_dir  /scratch/dharmendra.rs.phy23.itbhu/datasets/florence_data/fed_input_data \
-  --output_dir /home/dharmendra.rs.phy23.itbhu/asmit_2/IIT_H_internship/Florence/Output
+  --output_dir /home/dharmendra.rs.phy23.itbhu/asmit_2/IIT_H_internship/Florence/Output \
+  --mu_fedprox 1.5507
 """
